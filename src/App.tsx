@@ -36,6 +36,16 @@ import {
   resolveLibretroCoreWithFflate,
   SegaSystemKind,
 } from './wasm/archiveExtractor';
+import {
+  getAudioEngineStatus,
+  inspectAndBoostEmscriptenAudio,
+  installSegaAudioBridge,
+  setMasterAudioSettings,
+  unlockAndResumeAudioContexts,
+} from './wasm/segaAudioBridge';
+
+// Install global AudioContext & AudioNode.connect interceptor immediately on module load
+installSegaAudioBridge();
 
 type ConsoleState = 'IDLE_EMPTY' | 'EXTRACTING_ARCHIVE' | 'LOADING_ROM' | 'PLAYING';
 type CoreMode = 'LIBRETRO_GENESIS_PLUS_GX' | 'LOCAL_WASM_ENGINE';
@@ -53,36 +63,6 @@ type MdButton =
   | 'z'
   | 'start'
   | 'mode';
-
-// Track all browser AudioContexts created by Emscripten / OpenAL / WebAudio so we can resume them on mobile & desktop
-const trackedAudioContexts = new Set<AudioContext>();
-
-if (typeof window !== 'undefined') {
-  const OriginalAudioContext =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-
-  if (OriginalAudioContext && !(OriginalAudioContext as unknown as { __segaPatched?: boolean }).__segaPatched) {
-    const PatchedAudioContext = function (
-      this: AudioContext,
-      ...args: ConstructorParameters<typeof AudioContext>
-    ) {
-      const ctx = new OriginalAudioContext(...args);
-      trackedAudioContexts.add(ctx);
-      return ctx;
-    } as unknown as typeof AudioContext;
-
-    PatchedAudioContext.prototype = OriginalAudioContext.prototype;
-    Object.setPrototypeOf(PatchedAudioContext, OriginalAudioContext);
-    (PatchedAudioContext as unknown as { __segaPatched?: boolean }).__segaPatched = true;
-
-    window.AudioContext = PatchedAudioContext;
-    if ('webkitAudioContext' in window) {
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext =
-        PatchedAudioContext;
-    }
-  }
-}
 
 interface UnifiedSaveSlot {
   slotId: number;
@@ -168,6 +148,12 @@ function detectIsMobileBrowser(): boolean {
   return isMobileUA || (isCoarsePointer && isNarrowViewport);
 }
 
+const DEFAULT_GAME_GEAR_SOURCE_URL =
+  'https://www.smspower.org/Homebrew/BlackCastle-GG';
+const DEFAULT_GAME_GEAR_ROM_PATH = '/roms/BlackCastle.gg';
+const DEFAULT_GAME_GEAR_ROM_FILENAME = 'BlackCastle.gg';
+const DEFAULT_GAME_GEAR_ENTRY_ID = 'smspower-blackcastle-gg';
+
 export default function App() {
   // Detect mobile browser on startup -> default to GAME_GEAR on mobile phones
   const [activeSystem, setActiveSystem] = useState<SegaSystemKind>(() =>
@@ -193,11 +179,15 @@ export default function App() {
 
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [masterVolume, setMasterVolume] = useState<number>(90);
+  const [psgBoost, setPsgBoost] = useState<number>(1.8);
+  const [audioContextRunning, setAudioContextRunning] = useState<boolean>(false);
+
   const [crtScanlines, setCrtScanlines] = useState<boolean>(true);
   const [isDraggingRom, setIsDraggingRom] = useState<boolean>(false);
   const [connectedGamepadName, setConnectedGamepadName] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>(
-    'Toca la pantalla para cargar una ROM (.gg, .sms, .md, .zip, .7z) o pulsa MENU'
+    'Cargando ROM por defecto Game Gear (BlackCastle.gg)...'
   );
 
   // 3 Quick Save State Slots
@@ -231,10 +221,13 @@ export default function App() {
 
   const currentRomEntryRef = useRef<ExtractedRomEntry | null>(null);
   const isBuiltinDemoActiveRef = useRef<boolean>(false);
+  const hasAutoBootedDefaultRomRef = useRef<boolean>(false);
   const nostalgistRef = useRef<Nostalgist | null>(null);
   const localWasmRef = useRef<WasmRuntimeInstance | null>(null);
   const localEngineRef = useRef<GearsystemEngine | null>(null);
   const soundEnabledRef = useRef<boolean>(true);
+  const masterVolumeRef = useRef<number>(90);
+  const psgBoostRef = useRef<number>(1.8);
 
   const ctrlRef = useRef<ControllerState>({
     up: false,
@@ -248,55 +241,88 @@ export default function App() {
   });
 
   const syncAllAudioContexts = (shouldPlay: boolean) => {
-    try {
-      if (nostalgistRef.current) {
-        const al = nostalgistRef.current.getEmscriptenAL() as
-          | {
-              currentCtx?: { audioCtx?: AudioContext };
-              contexts?: Record<string, { audioCtx?: AudioContext }>;
-            }
-          | undefined;
-        if (al?.currentCtx?.audioCtx) {
-          trackedAudioContexts.add(al.currentCtx.audioCtx);
-        }
-        if (al?.contexts) {
-          Object.values(al.contexts).forEach((c) => {
-            if (c?.audioCtx) trackedAudioContexts.add(c.audioCtx);
-          });
-        }
-      }
-    } catch {
-      // ignore if emulator AL is not ready yet
-    }
-
-    trackedAudioContexts.forEach((ctx) => {
-      try {
-        if (ctx.state === 'closed') {
-          trackedAudioContexts.delete(ctx);
-          return;
-        }
-        if (shouldPlay && ctx.state === 'suspended') {
-          ctx.resume().catch(() => {});
-        } else if (!shouldPlay && ctx.state === 'running') {
-          ctx.suspend().catch(() => {});
-        }
-      } catch {
-        // ignore audio state transitions
-      }
+    setMasterAudioSettings({
+      enabled: shouldPlay,
+      volumePercent: masterVolumeRef.current,
+      psgBoost: psgBoostRef.current,
     });
+    if (nostalgistRef.current) {
+      inspectAndBoostEmscriptenAudio(nostalgistRef.current);
+    } else if (shouldPlay) {
+      unlockAndResumeAudioContexts();
+    }
+    setAudioContextRunning(getAudioEngineStatus().isRunning);
   };
 
   const resizeActiveEmulatorViewport = () => {
-    if (!nostalgistRef.current || !emulatorMountRef.current) return;
-    const rect = emulatorMountRef.current.getBoundingClientRect();
-    const width = Math.max(320, Math.floor(rect.width));
-    const height = Math.max(240, Math.floor(rect.height));
-    try {
-      nostalgistRef.current.resize({ width, height });
-    } catch {
-      // ignore resize before postRun
-    }
+    if (!activeWebglCanvasRef.current) return;
+    activeWebglCanvasRef.current.style.width = '100%';
+    activeWebglCanvasRef.current.style.height = '100%';
   };
+
+  // Seamless WebGL canvas transfer when rotating between Portrait and Landscape
+  useEffect(() => {
+    if (
+      emulatorMountRef.current &&
+      activeWebglCanvasRef.current &&
+      !emulatorMountRef.current.contains(activeWebglCanvasRef.current)
+    ) {
+      emulatorMountRef.current.innerHTML = '';
+      emulatorMountRef.current.appendChild(activeWebglCanvasRef.current);
+    }
+    resizeActiveEmulatorViewport();
+  }, [isLandscape]);
+
+  // Global silent mobile gesture unlock & visibility recovery for AudioContext
+  useEffect(() => {
+    installSegaAudioBridge();
+    setMasterAudioSettings({
+      enabled: soundEnabledRef.current,
+      volumePercent: masterVolumeRef.current,
+      psgBoost: psgBoostRef.current,
+    });
+
+    const handleUserGestureUnlock = () => {
+      if (soundEnabledRef.current) {
+        if (nostalgistRef.current) {
+          inspectAndBoostEmscriptenAudio(nostalgistRef.current);
+        } else {
+          unlockAndResumeAudioContexts();
+        }
+        setAudioContextRunning(getAudioEngineStatus().isRunning);
+      }
+    };
+
+    const handleVisibilityRecovery = () => {
+      if (document.visibilityState === 'visible' && soundEnabledRef.current) {
+        handleUserGestureUnlock();
+      }
+    };
+
+    window.addEventListener('touchstart', handleUserGestureUnlock, { capture: true, passive: true });
+    window.addEventListener('pointerdown', handleUserGestureUnlock, { capture: true, passive: true });
+    window.addEventListener('click', handleUserGestureUnlock, { capture: true });
+    document.addEventListener('visibilitychange', handleVisibilityRecovery);
+
+    return () => {
+      window.removeEventListener('touchstart', handleUserGestureUnlock, { capture: true });
+      window.removeEventListener('pointerdown', handleUserGestureUnlock, { capture: true });
+      window.removeEventListener('click', handleUserGestureUnlock, { capture: true });
+      document.removeEventListener('visibilitychange', handleVisibilityRecovery);
+    };
+  }, []);
+
+  // Periodic watchdog while PLAYING so any lazily-created Emscripten AudioContext is unlocked & boosted
+  useEffect(() => {
+    if (consoleState !== 'PLAYING') return;
+    const timer = window.setInterval(() => {
+      if (nostalgistRef.current && soundEnabledRef.current) {
+        inspectAndBoostEmscriptenAudio(nostalgistRef.current);
+      }
+      setAudioContextRunning(getAudioEngineStatus().isRunning);
+    }, 600);
+    return () => window.clearInterval(timer);
+  }, [consoleState]);
 
   // Track orientation & viewport resize dynamically across Chrome/Safari on Android & iOS
   useEffect(() => {
@@ -607,14 +633,16 @@ export default function App() {
     }
     container.innerHTML = '';
 
-    const rect = container.getBoundingClientRect();
-    const width = Math.max(320, Math.floor(rect.width) || 480);
-    const height = Math.max(240, Math.floor(rect.height) || 360);
+    // Use a 4:3 internal WebGL buffer (640x480) paired with aspect_ratio_index: 0 (4:3)
+    // so RetroArch renders across 100% of the canvas width (0px lateral pillarboxing),
+    // while CSS stretches the canvas edge-to-edge across the full mobile screen width.
+    const width = 640;
+    const height = 480;
 
     const freshCanvas = document.createElement('canvas');
     freshCanvas.width = width;
     freshCanvas.height = height;
-    freshCanvas.className = 'pixelated w-full h-full object-contain block';
+    freshCanvas.className = 'pixelated w-full h-full object-fill block';
     freshCanvas.tabIndex = -1;
 
     container.appendChild(freshCanvas);
@@ -642,8 +670,12 @@ export default function App() {
                 : targetSystem === 'SG_1000'
                 ? 'sg-1000'
                 : 'auto',
+            genesis_plus_gx_sound_output: 'stereo',
+            genesis_plus_gx_psg_preamp: '150',
             genesis_plus_gx_ym2413: 'auto',
             genesis_plus_gx_lcd_filter: 'disabled',
+            genesis_plus_gx_overscan: 'disabled',
+            genesis_plus_gx_gg_extra: 'disabled',
           }
         : {};
 
@@ -680,11 +712,15 @@ export default function App() {
         input_player1_r: 'c',
         input_player1_start: 'enter',
         input_player1_select: 'rshift',
+        // Always initialize RetroArch audio driver active; Master GainNode controls live mute/volume
         audio_enable: true,
-        audio_mute_enable: !soundEnabledRef.current,
+        audio_mute_enable: false,
+        audio_sync: true,
+        audio_volume: 6.0,
         audio_out_rate: 48000,
         audio_latency: 64,
-        video_aspect_ratio_auto: true,
+        video_aspect_ratio_auto: false,
+        aspect_ratio_index: 0,
       },
     });
   };
@@ -698,6 +734,11 @@ export default function App() {
     setIsBottomMenuOpen(false);
     setConsoleState('LOADING_ROM');
     setIsPaused(false);
+
+    // Pre-unlock AudioContext synchronously while inside user selection gesture
+    if (soundEnabledRef.current) {
+      unlockAndResumeAudioContexts();
+    }
 
     const targetSystem = forcedSystem ?? entry.system;
     setActiveSystem(targetSystem);
@@ -750,6 +791,7 @@ export default function App() {
       setConsoleState('PLAYING');
       setStatusMessage(`${entry.fileName} · ${targetSpec.shortLabel}`);
 
+      inspectAndBoostEmscriptenAudio(instance);
       requestAnimationFrame(() => {
         resizeActiveEmulatorViewport();
         syncAllAudioContexts(soundEnabledRef.current);
@@ -759,12 +801,70 @@ export default function App() {
     }
   };
 
+  const bootDefaultGameGearItchRom = async () => {
+    setIsBottomMenuOpen(false);
+    setConsoleState('LOADING_ROM');
+    setLoadedRomTitle(DEFAULT_GAME_GEAR_ROM_FILENAME);
+    setStatusMessage('Cargando Black Castle (Game Gear · SMS Power)...');
+
+    try {
+      const response = await fetch(encodeURI(DEFAULT_GAME_GEAR_ROM_PATH));
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      const romBytes = new Uint8Array(arrayBuffer);
+
+      const defaultEntry: ExtractedRomEntry = {
+        id: DEFAULT_GAME_GEAR_ENTRY_ID,
+        fileName: DEFAULT_GAME_GEAR_ROM_FILENAME,
+        fullPath: DEFAULT_GAME_GEAR_SOURCE_URL,
+        extension: 'gg',
+        system: 'GAME_GEAR',
+        sizeBytes: romBytes.byteLength,
+        data: romBytes,
+      };
+
+      await bootExtractedRomEntry(defaultEntry, 'GAME_GEAR');
+    } catch {
+      const demo = BUILTIN_CARTRIDGES[2];
+      bootLocalWasmFallback(demo.title, demo.data, 'GAME_GEAR');
+    }
+  };
+
+  // Automatically boot the default Game Gear ROM from itch.io (game_id=1988861) on initial load
+  useEffect(() => {
+    if (hasAutoBootedDefaultRomRef.current) return;
+    if (activeSystem === 'GAME_GEAR') {
+      hasAutoBootedDefaultRomRef.current = true;
+      void bootDefaultGameGearItchRom();
+    }
+  }, [activeSystem]);
+
   const handleSelectConsoleFromDropdown = async (newSystem: SegaSystemKind) => {
     setIsConsoleDropdownOpen(false);
     setActiveSystem(newSystem);
 
+    if (newSystem === 'GAME_GEAR') {
+      // If no custom user ROM was loaded (or if running default/demo), boot the default itch.io Game Gear ROM
+      const hasCustomUserRom =
+        currentRomEntryRef.current &&
+        currentRomEntryRef.current.id !== DEFAULT_GAME_GEAR_ENTRY_ID &&
+        !isBuiltinDemoActiveRef.current;
+
+      if (hasCustomUserRom && currentRomEntryRef.current) {
+        await bootExtractedRomEntry(currentRomEntryRef.current, 'GAME_GEAR');
+      } else {
+        await bootDefaultGameGearItchRom();
+      }
+      return;
+    }
+
     if (consoleState === 'PLAYING') {
-      if (isBuiltinDemoActiveRef.current) {
+      if (
+        isBuiltinDemoActiveRef.current ||
+        currentRomEntryRef.current?.id === DEFAULT_GAME_GEAR_ENTRY_ID
+      ) {
         handleBootBuiltinSystemDemo(newSystem);
       } else if (currentRomEntryRef.current) {
         await bootExtractedRomEntry(currentRomEntryRef.current, newSystem);
@@ -779,6 +879,10 @@ export default function App() {
     setIsBottomMenuOpen(false);
     setConsoleState('EXTRACTING_ARCHIVE');
     setStatusMessage(`Descomprimiendo ${file.name}...`);
+
+    if (soundEnabledRef.current) {
+      unlockAndResumeAudioContexts();
+    }
 
     try {
       const entries = await extractRomsFromUploadedFile(file);
@@ -846,6 +950,7 @@ export default function App() {
     }
 
     const engine = new GearsystemEngine(localWasmRef.current, customCart);
+    engine.setVolumeParameters(masterVolumeRef.current, psgBoostRef.current);
     engine.toggleAudio(soundEnabledRef.current);
     localEngineRef.current = engine;
     setActiveSystem(system);
@@ -855,9 +960,14 @@ export default function App() {
     setConsoleState('PLAYING');
     setIsPaused(false);
     setStatusMessage(`${title}`);
+    syncAllAudioContexts(soundEnabledRef.current);
   };
 
   const handleBootBuiltinSystemDemo = (sys: SegaSystemKind) => {
+    if (sys === 'GAME_GEAR') {
+      void bootDefaultGameGearItchRom();
+      return;
+    }
     cleanupActiveInstance();
     setIsBottomMenuOpen(false);
     setArchiveEntries([]);
@@ -866,8 +976,6 @@ export default function App() {
     const cartIndex =
       sys === 'MASTER_SYSTEM'
         ? 1
-        : sys === 'GAME_GEAR'
-        ? 2
         : sys === 'SG_1000'
         ? 4
         : 0;
@@ -876,7 +984,7 @@ export default function App() {
       id: demo.id,
       fileName: demo.title,
       fullPath: demo.title,
-      extension: sys === 'MASTER_SYSTEM' ? 'sms' : sys === 'GAME_GEAR' ? 'gg' : 'md',
+      extension: sys === 'MASTER_SYSTEM' ? 'sms' : 'md',
       system: sys,
       sizeBytes: demo.sizeBytes,
       data: demo.data,
@@ -946,6 +1054,57 @@ export default function App() {
     if (localEngineRef.current) {
       localEngineRef.current.toggleAudio(nextSound);
     }
+  };
+
+  const handleMasterVolumeChange = (nextVol: number) => {
+    const clamped = Math.max(0, Math.min(100, nextVol));
+    masterVolumeRef.current = clamped;
+    setMasterVolume(clamped);
+
+    const autoEnable = clamped > 0;
+    if (autoEnable !== soundEnabledRef.current) {
+      soundEnabledRef.current = autoEnable;
+      setSoundEnabled(autoEnable);
+    }
+
+    setMasterAudioSettings({
+      enabled: autoEnable,
+      volumePercent: clamped,
+      psgBoost: psgBoostRef.current,
+    });
+
+    if (localEngineRef.current) {
+      localEngineRef.current.setVolumeParameters(clamped, psgBoostRef.current);
+      localEngineRef.current.toggleAudio(autoEnable);
+    }
+    if (nostalgistRef.current) {
+      inspectAndBoostEmscriptenAudio(nostalgistRef.current);
+    } else if (autoEnable) {
+      unlockAndResumeAudioContexts();
+    }
+    setAudioContextRunning(getAudioEngineStatus().isRunning);
+  };
+
+  const handlePsgBoostChange = (nextBoost: number) => {
+    const clamped = Number(Math.max(1.0, Math.min(3.0, nextBoost)).toFixed(1));
+    psgBoostRef.current = clamped;
+    setPsgBoost(clamped);
+
+    setMasterAudioSettings({
+      enabled: soundEnabledRef.current,
+      volumePercent: masterVolumeRef.current,
+      psgBoost: clamped,
+    });
+
+    if (localEngineRef.current) {
+      localEngineRef.current.setVolumeParameters(masterVolumeRef.current, clamped);
+    }
+    if (nostalgistRef.current) {
+      inspectAndBoostEmscriptenAudio(nostalgistRef.current);
+    } else if (soundEnabledRef.current) {
+      unlockAndResumeAudioContexts();
+    }
+    setAudioContextRunning(getAudioEngineStatus().isRunning);
   };
 
   const handleSaveStateSlot = async (slotId: number) => {
@@ -1023,9 +1182,11 @@ export default function App() {
     CONSOLE_OPTIONS.find((c) => c.id === activeSystem) ?? CONSOLE_OPTIONS[0];
 
   // Shared Physical D-Pad Component (Sega Game Gear Rounded Cross D-Pad)
-  const renderPhysicalDPad = (sizeClass: string) => (
+  const renderPhysicalDPad = (sizeClass: string, compact = false) => (
     <div
-      className={`relative ${sizeClass} rounded-full bg-[#14171D] border-2 border-[#2D333F] shadow-inner p-2 grid grid-cols-3 grid-rows-3 gap-1 shrink-0`}
+      className={`relative ${sizeClass} rounded-full bg-[#14171D] border-2 border-[#2D333F] shadow-inner ${
+        compact ? 'p-1.5 gap-0.5' : 'p-2 gap-1'
+      } grid grid-cols-3 grid-rows-3 shrink-0`}
     >
       <div />
       <button
@@ -1041,7 +1202,9 @@ export default function App() {
           triggerButtonState('up', false);
         }}
         aria-label="Arriba"
-        className={`rounded-t-lg font-mono text-xs font-bold flex items-center justify-center border transition-transform cursor-pointer ${
+        className={`rounded-t-md font-mono ${
+          compact ? 'text-[10px]' : 'text-xs'
+        } font-bold flex items-center justify-center border transition-transform cursor-pointer ${
           activeButtons.up
             ? 'bg-sky-400 text-slate-950 border-sky-300 scale-95'
             : 'bg-[#282D38] text-slate-200 border-[#3B4252] active:scale-95'
@@ -1064,7 +1227,9 @@ export default function App() {
           triggerButtonState('left', false);
         }}
         aria-label="Izquierda"
-        className={`rounded-l-lg font-mono text-xs font-bold flex items-center justify-center border transition-transform cursor-pointer ${
+        className={`rounded-l-md font-mono ${
+          compact ? 'text-[10px]' : 'text-xs'
+        } font-bold flex items-center justify-center border transition-transform cursor-pointer ${
           activeButtons.left
             ? 'bg-sky-400 text-slate-950 border-sky-300 scale-95'
             : 'bg-[#282D38] text-slate-200 border-[#3B4252] active:scale-95'
@@ -1075,7 +1240,11 @@ export default function App() {
 
       {/* Center D-Pad Pivot Circle */}
       <div className="bg-[#20242D] flex items-center justify-center">
-        <div className="w-4 h-4 rounded-full bg-[#15181E] border border-[#323846]" />
+        <div
+          className={`${
+            compact ? 'w-3 h-3' : 'w-4 h-4'
+          } rounded-full bg-[#15181E] border border-[#323846]`}
+        />
       </div>
 
       <button
@@ -1091,7 +1260,9 @@ export default function App() {
           triggerButtonState('right', false);
         }}
         aria-label="Derecha"
-        className={`rounded-r-lg font-mono text-xs font-bold flex items-center justify-center border transition-transform cursor-pointer ${
+        className={`rounded-r-md font-mono ${
+          compact ? 'text-[10px]' : 'text-xs'
+        } font-bold flex items-center justify-center border transition-transform cursor-pointer ${
           activeButtons.right
             ? 'bg-sky-400 text-slate-950 border-sky-300 scale-95'
             : 'bg-[#282D38] text-slate-200 border-[#3B4252] active:scale-95'
@@ -1114,7 +1285,9 @@ export default function App() {
           triggerButtonState('down', false);
         }}
         aria-label="Abajo"
-        className={`rounded-b-lg font-mono text-xs font-bold flex items-center justify-center border transition-transform cursor-pointer ${
+        className={`rounded-b-md font-mono ${
+          compact ? 'text-[10px]' : 'text-xs'
+        } font-bold flex items-center justify-center border transition-transform cursor-pointer ${
           activeButtons.down
             ? 'bg-sky-400 text-slate-950 border-sky-300 scale-95'
             : 'bg-[#282D38] text-slate-200 border-[#3B4252] active:scale-95'
@@ -1129,11 +1302,16 @@ export default function App() {
   // Shared Action Buttons (2-Button Game Gear / Master System OR 6-Button Mega Drive)
   const renderPhysicalActionButtons = (compact = false) => {
     if (isTwoButtonPad) {
-      const btnSize = compact ? 'w-14 h-14 text-sm' : 'w-16 h-16 text-base';
+      const btnSize = compact
+        ? 'w-11 h-11 sm:w-12 sm:h-12 text-xs'
+        : 'w-16 h-16 text-base';
+      const gapClass = compact ? 'gap-2 sm:gap-2.5' : 'gap-3.5';
+      const offsetBtn1 = compact ? 'mt-2' : 'mt-4';
+      const offsetBtn2 = compact ? '-mt-2' : '-mt-4';
       return (
-        <div className="flex items-center gap-3.5 -rotate-12">
+        <div className={`flex items-center ${gapClass} -rotate-12`}>
           {/* Button 1 (Bottom-Left) */}
-          <div className="flex flex-col items-center gap-1 mt-4">
+          <div className={`flex flex-col items-center gap-0.5 ${offsetBtn1}`}>
             <button
               onMouseDown={() => triggerButtonState('a', true)}
               onMouseUp={() => triggerButtonState('a', false)}
@@ -1154,13 +1332,13 @@ export default function App() {
             >
               1
             </button>
-            <span className="font-mono text-[10px] font-bold tracking-wider text-slate-400">
+            <span className="font-mono text-[9px] font-bold tracking-wider text-slate-400">
               1
             </span>
           </div>
 
           {/* Button 2 (Top-Right) */}
-          <div className="flex flex-col items-center gap-1 -mt-4">
+          <div className={`flex flex-col items-center gap-0.5 ${offsetBtn2}`}>
             <button
               onMouseDown={() => triggerButtonState('b', true)}
               onMouseUp={() => triggerButtonState('b', false)}
@@ -1181,7 +1359,7 @@ export default function App() {
             >
               2
             </button>
-            <span className="font-mono text-[10px] font-bold tracking-wider text-slate-400">
+            <span className="font-mono text-[9px] font-bold tracking-wider text-slate-400">
               2
             </span>
           </div>
@@ -1190,11 +1368,11 @@ export default function App() {
     }
 
     // 6-Button Mega Drive Layout
-    const mdBtnSmall = compact ? 'w-10 h-9 text-xs' : 'w-11 h-10 text-xs';
-    const mdBtnLarge = compact ? 'w-11 h-11 text-xs' : 'w-12 h-12 text-sm';
+    const mdBtnSmall = compact ? 'w-7 h-7 sm:w-8 sm:h-8 text-[10px]' : 'w-11 h-10 text-xs';
+    const mdBtnLarge = compact ? 'w-8 h-8 sm:w-9 sm:h-9 text-[11px]' : 'w-12 h-12 text-sm';
     return (
-      <div className="space-y-1.5 -rotate-6">
-        <div className="flex items-center justify-end gap-1.5">
+      <div className="space-y-1 -rotate-6">
+        <div className="flex items-center justify-end gap-1">
           {(['x', 'y', 'z'] as const).map((btn) => (
             <button
               key={btn}
@@ -1219,7 +1397,7 @@ export default function App() {
             </button>
           ))}
         </div>
-        <div className="flex items-center justify-end gap-1.5">
+        <div className="flex items-center justify-end gap-1">
           {(['a', 'b', 'c'] as const).map((btn) => (
             <button
               key={btn}
@@ -1248,93 +1426,75 @@ export default function App() {
     );
   };
 
-  // Shared Physical MENU & START Pill Buttons (Integrated into the console shell)
+  // Physical MENU Button (opens the Bottom Sheet)
+  const renderPhysicalMenuButton = (compact = false) => (
+    <button
+      onClick={() => setIsBottomMenuOpen(true)}
+      className={`${
+        compact ? 'px-3 py-1 min-h-[28px] text-[10px]' : 'px-4 py-1.5 min-h-[34px] text-[11px]'
+      } rounded-full bg-[#282E3A] hover:bg-[#323A48] active:scale-95 border-2 border-[#434C5E] shadow-md font-mono font-bold tracking-wider text-slate-200 transition-transform cursor-pointer flex items-center gap-1.5`}
+    >
+      <SlidersHorizontal className="w-3 h-3 text-sky-400 shrink-0" />
+      MENU
+    </button>
+  );
+
+  // Classic Game Gear Blue Oval START Button
+  const renderPhysicalStartButton = (compact = false) => (
+    <button
+      onMouseDown={() => triggerButtonState('start', true)}
+      onMouseUp={() => triggerButtonState('start', false)}
+      onMouseLeave={() => triggerButtonState('start', false)}
+      onTouchStart={(e) => {
+        e.preventDefault();
+        triggerButtonState('start', true);
+      }}
+      onTouchEnd={(e) => {
+        e.preventDefault();
+        triggerButtonState('start', false);
+      }}
+      className={`${
+        compact ? 'px-3.5 py-1 min-h-[28px] text-[10px]' : 'px-5 py-1.5 min-h-[34px] text-[11px]'
+      } rounded-full font-mono font-bold tracking-wider border-2 shadow-md transition-transform cursor-pointer ${
+        activeButtons.start
+          ? 'bg-amber-400 text-slate-950 border-amber-200 scale-95'
+          : 'bg-[#1D4ED8] hover:bg-[#2563EB] text-white border-[#3B82F6] active:scale-95'
+      }`}
+    >
+      START
+    </button>
+  );
+
+  // Shared Physical MENU & START Pill Buttons for Portrait Mode
   const renderPhysicalMenuAndStartButtons = (verticalStack = false) => (
     <div
       className={`flex ${
         verticalStack ? 'flex-col items-end gap-2.5' : 'items-center justify-center gap-5'
       }`}
     >
-      {/* Physical MENU Button that opens the Bottom Sheet */}
-      <div className="flex flex-col items-center gap-1">
-        <button
-          onClick={() => setIsBottomMenuOpen(true)}
-          className="px-4 py-1.5 min-h-[34px] rounded-full bg-[#282E3A] hover:bg-[#323A48] active:scale-95 border-2 border-[#434C5E] shadow-md font-mono text-[11px] font-bold tracking-wider text-slate-200 transition-transform cursor-pointer flex items-center gap-1.5"
-        >
-          <SlidersHorizontal className="w-3 h-3 text-sky-400" />
-          MENU
-        </button>
-      </div>
-
-      {/* Classic Game Gear Blue Oval START Button */}
-      <div className="flex flex-col items-center gap-1">
-        <button
-          onMouseDown={() => triggerButtonState('start', true)}
-          onMouseUp={() => triggerButtonState('start', false)}
-          onMouseLeave={() => triggerButtonState('start', false)}
-          onTouchStart={(e) => {
-            e.preventDefault();
-            triggerButtonState('start', true);
-          }}
-          onTouchEnd={(e) => {
-            e.preventDefault();
-            triggerButtonState('start', false);
-          }}
-          className={`px-5 py-1.5 min-h-[34px] rounded-full font-mono text-[11px] font-bold tracking-wider border-2 shadow-md transition-transform cursor-pointer ${
-            activeButtons.start
-              ? 'bg-amber-400 text-slate-950 border-amber-200 scale-95'
-              : 'bg-[#1D4ED8] hover:bg-[#2563EB] text-white border-[#3B82F6] active:scale-95'
-          }`}
-        >
-          START
-        </button>
-      </div>
+      <div className="flex flex-col items-center gap-1">{renderPhysicalMenuButton(false)}</div>
+      <div className="flex flex-col items-center gap-1">{renderPhysicalStartButton(false)}</div>
     </div>
   );
 
-  // Shared Game Gear Screen Lens Bezel & Canvas Viewport
-  const renderGameGearScreenBezel = () => (
-    <div className="w-full h-full flex flex-col rounded-2xl bg-[#0B0D12] border-2 border-[#2D3340] p-2.5 sm:p-3.5 shadow-2xl overflow-hidden">
-      {/* Top Bezel Header: Red BATTERY LED + SEGA GAME GEAR Logo + Red-Green-Blue Tri-Color Stripe */}
-      <div className="flex items-center justify-between gap-2 pb-2 px-1 shrink-0">
-        <div className="flex items-center gap-1.5">
-          <span
-            className={`w-2.5 h-2.5 rounded-full ${
-              consoleState === 'PLAYING'
-                ? 'bg-red-500 shadow-[0_0_8px_#ef4444]'
-                : 'bg-red-900/70'
-            }`}
-          />
-          <span className="font-mono text-[9px] sm:text-[10px] font-bold tracking-widest text-slate-400">
-            BATTERY
-          </span>
-        </div>
-
-        <div className="font-mono text-[11px] sm:text-xs font-extrabold tracking-widest text-slate-200 truncate">
-          {activeConsoleOption.bezelBrand}
-        </div>
-
-        {/* Classic Game Gear Red-Green-Blue Emblem */}
-        <div className="flex items-center gap-1 shrink-0" aria-hidden="true">
-          <span className="w-2.5 h-3.5 bg-red-500 rounded-xs -skew-x-12" />
-          <span className="w-2.5 h-3.5 bg-emerald-500 rounded-xs -skew-x-12" />
-          <span className="w-2.5 h-3.5 bg-blue-500 rounded-xs -skew-x-12" />
-        </div>
-      </div>
-
-      {/* Inner Recessed LCD / CRT Screen */}
+  // Game Screen Viewport:
+  // - In Portrait mode: 100% full width edge-to-edge with slim status bar below the image
+  // - In Landscape mode: 100% full height from top edge to bottom edge, centered between left & right control wings
+  const renderGameGearScreenBezel = (fullHeightLandscape = false) => (
+    <div className="w-full h-full flex flex-col bg-black overflow-hidden">
+      {/* Pure Game Image Area */}
       <div
         onClick={() => {
           if (consoleState === 'PLAYING' && soundEnabledRef.current) {
             syncAllAudioContexts(true);
           }
         }}
-        className="relative flex-1 w-full bg-black rounded-xl border border-[#1E2430] overflow-hidden flex items-center justify-center min-h-0"
+        className="relative flex-1 w-full h-full bg-black overflow-hidden flex items-center justify-center min-h-0"
       >
-        {/* Dedicated WebGL Mount Container (always laid out with non-zero dimensions) */}
+        {/* Dedicated WebGL Mount Container (100% width and height) */}
         <div
           ref={emulatorMountRef}
-          className={`w-full h-full flex items-center justify-center ${
+          className={`emulator-screen-mount w-full h-full flex items-center justify-center ${
             coreMode === 'LOCAL_WASM_ENGINE' && consoleState === 'PLAYING' ? 'hidden' : 'flex'
           }`}
         />
@@ -1344,7 +1504,7 @@ export default function App() {
           ref={localCanvasRef}
           width={256}
           height={192}
-          className={`pixelated w-full h-full object-contain ${
+          className={`pixelated w-full h-full object-fill ${
             coreMode === 'LOCAL_WASM_ENGINE' && consoleState === 'PLAYING' ? 'block' : 'hidden'
           }`}
         />
@@ -1405,13 +1565,38 @@ export default function App() {
         )}
       </div>
 
-      {/* Bottom Bezel Status Micro-Line */}
-      <div className="pt-1.5 px-1 flex items-center justify-between text-[10px] font-mono text-slate-400 shrink-0">
-        <span className="truncate max-w-[70%]">{statusMessage}</span>
-        <span className="text-slate-500">
-          {connectedGamepadName ? 'PAD USB/BT' : activeConsoleOption.shortLabel.toUpperCase()}
-        </span>
-      </div>
+      {/* Slim Bottom Bezel Bar only in Portrait mode so Landscape screen uses 100% of vertical height */}
+      {!fullHeightLandscape && (
+        <div className="w-full px-3 py-1 bg-[#0B0D12] border-y border-[#2D3340] flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${
+                consoleState === 'PLAYING'
+                  ? 'bg-red-500 shadow-[0_0_8px_#ef4444]'
+                  : 'bg-red-900/70'
+              }`}
+            />
+            <span className="font-mono text-[9px] font-bold tracking-widest text-slate-400 shrink-0">
+              BATTERY
+            </span>
+            <span className="text-slate-700">·</span>
+            <span className="font-mono text-[10px] text-slate-400 truncate">
+              {statusMessage}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="font-mono text-[10px] font-extrabold tracking-widest text-slate-200">
+              {activeConsoleOption.bezelBrand}
+            </span>
+            <div className="flex items-center gap-0.5" aria-hidden="true">
+              <span className="w-2 h-3 bg-red-500 rounded-xs -skew-x-12" />
+              <span className="w-2 h-3 bg-emerald-500 rounded-xs -skew-x-12" />
+              <span className="w-2 h-3 bg-blue-500 rounded-xs -skew-x-12" />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 
@@ -1453,59 +1638,88 @@ export default function App() {
       )}
 
       {/* =====================================================================
-          ORIENTATION 1: PORTRAIT MODE (Game Boy Vertical Ergonomics + Game Gear Colors)
+          ORIENTATION 1: PORTRAIT MODE (100% Edge-to-Edge Full-Width Screen + Game Gear Deck Below)
           ===================================================================== */}
       {!isLandscape ? (
-        <div className="w-full h-full max-w-md mx-auto rounded-[28px] bg-[#222731] border-2 border-[#333A48] shadow-2xl p-3.5 sm:p-4 flex flex-col justify-between gap-3 overflow-hidden">
-          {/* Top Half (52% height): Game Gear Bezel + Screen */}
-          <div className="w-full h-[50%] min-h-0 flex flex-col">
-            {renderGameGearScreenBezel()}
+        <div className="w-full h-full bg-[#222731] flex flex-col justify-between overflow-hidden">
+          {/* Top Half (55% height): 100% Full-Width Screen with ZERO lateral padding or side elements */}
+          <div className="w-full h-[55%] min-h-0 flex flex-col">
+            {renderGameGearScreenBezel(false)}
           </div>
 
-          {/* Decorative Game Gear Speaker Grille Strip */}
-          <div className="flex items-center justify-between px-3 shrink-0">
-            <div className="w-16 h-3 rounded-full gg-speaker-grille opacity-75" />
-            <span className="font-mono text-[10px] font-bold tracking-widest text-slate-400">
-              PORTABLE WASM SYSTEM
-            </span>
-            <div className="w-16 h-3 rounded-full gg-speaker-grille opacity-75" />
-          </div>
+          {/* Lower Game Gear Tactile Control Deck */}
+          <div className="flex-1 min-h-0 flex flex-col justify-between px-4 py-2.5">
+            {/* Middle Physical Controls Row: Left D-Pad + Right 1/2 Buttons */}
+            <div className="flex-1 min-h-0 flex items-center justify-between px-1 sm:px-4">
+              {renderPhysicalDPad('w-32 h-32 sm:w-36 sm:h-36')}
+              {renderPhysicalActionButtons(false)}
+            </div>
 
-          {/* Middle Physical Controls Row: Left D-Pad + Right 1/2 Buttons */}
-          <div className="flex-1 min-h-0 flex items-center justify-between px-2 sm:px-4">
-            {renderPhysicalDPad('w-32 h-32 sm:w-36 sm:h-36')}
-            {renderPhysicalActionButtons(false)}
-          </div>
-
-          {/* Bottom Center Physical Buttons: [ MENU ] and [ START ] */}
-          <div className="pb-1 pt-1 shrink-0">
-            {renderPhysicalMenuAndStartButtons(false)}
+            {/* Bottom Center Physical Buttons: [ MENU ] and [ START ] */}
+            <div className="pb-1 pt-1 shrink-0">
+              {renderPhysicalMenuAndStartButtons(false)}
+            </div>
           </div>
         </div>
       ) : (
         /* =====================================================================
            ORIENTATION 2: LANDSCAPE MODE (Classic Horizontal SEGA Game Gear Shell)
+           - Center emulator screen occupies 100% of the screen height (h-full) and is centered
+           - Left wing holds Red BATTERY LED -> MENU button below BATTERY -> Resized D-Pad -> Speaker Grille
+           - Right wing holds Blue Oval START button above Resized Action Buttons (1 & 2) -> Game Gear RGB Emblem
            ===================================================================== */
-        <div className="w-full h-full max-w-5xl mx-auto rounded-[34px] bg-[#222731] border-2 border-[#333A48] shadow-2xl px-4 py-3 flex items-center justify-between gap-3 sm:gap-5 overflow-hidden">
-          {/* Left Wing Grip: Speaker Grille + Classic D-Pad */}
-          <div className="w-36 sm:w-44 h-full flex flex-col items-center justify-between py-2 shrink-0">
-            <div className="w-20 h-5 rounded-lg gg-speaker-grille opacity-80" />
-            {renderPhysicalDPad('w-32 h-32 sm:w-36 sm:h-36')}
-            <div className="font-mono text-[10px] font-bold tracking-widest text-slate-400">
-              D-PAD
+        <div className="w-full h-full bg-[#222731] flex items-center justify-between overflow-hidden">
+          {/* Left Wing Grip: BATTERY LED at Top -> MENU button below BATTERY -> Resized D-Pad */}
+          <div className="flex-1 h-full flex flex-col items-center justify-between py-2.5 px-1.5 min-w-0 overflow-hidden">
+            <div className="flex flex-col items-center gap-2">
+              <div className="flex items-center gap-1.5">
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    consoleState === 'PLAYING'
+                      ? 'bg-red-500 shadow-[0_0_8px_#ef4444]'
+                      : 'bg-red-900/70'
+                  }`}
+                />
+                <span className="font-mono text-[9px] font-bold tracking-widest text-slate-400">
+                  BATTERY
+                </span>
+              </div>
+              {/* MENU Button placed on the left side directly below BATTERY */}
+              {renderPhysicalMenuButton(true)}
             </div>
+
+            <div className="my-auto flex items-center justify-center">
+              {renderPhysicalDPad('w-20 h-20 sm:w-24 sm:h-24', true)}
+            </div>
+
+            <div className="w-12 h-2.5 rounded-md gg-speaker-grille opacity-80 shrink-0" />
           </div>
 
-          {/* Center Viewport: Game Gear Bezel Screen */}
-          <div className="flex-1 h-full min-w-0 flex flex-col">
-            {renderGameGearScreenBezel()}
+          {/* Center Viewport: Occupies 100% of the vertical screen height (h-full) and centered in the middle */}
+          <div className="h-full aspect-[4/3] max-w-[58vw] sm:max-w-[64vw] shrink-0 bg-black border-x-2 border-[#12151C] shadow-2xl flex flex-col overflow-hidden">
+            {renderGameGearScreenBezel(true)}
           </div>
 
-          {/* Right Wing Grip: Physical START + MENU at Top, Action Buttons 1 & 2 in Center */}
-          <div className="w-36 sm:w-44 h-full flex flex-col items-center justify-between py-2 shrink-0">
-            {renderPhysicalMenuAndStartButtons(false)}
-            <div className="my-auto">{renderPhysicalActionButtons(true)}</div>
-            <div className="w-20 h-4 rounded-lg gg-speaker-grille opacity-70" />
+          {/* Right Wing Grip: Physical START button at Top (above buttons 1 & 2), Resized Action Buttons 1 & 2 in Center, Game Gear RGB Emblem at Bottom */}
+          <div className="flex-1 h-full flex flex-col items-center justify-between py-2.5 px-1.5 min-w-0 overflow-hidden">
+            <div className="flex flex-col items-center justify-center pt-1">
+              {renderPhysicalStartButton(true)}
+            </div>
+
+            <div className="my-auto flex items-center justify-center">
+              {renderPhysicalActionButtons(true)}
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0">
+              <span className="font-mono text-[9px] sm:text-[10px] font-extrabold tracking-widest text-slate-200 truncate">
+                {activeConsoleOption.bezelBrand}
+              </span>
+              <div className="flex items-center gap-0.5 shrink-0" aria-hidden="true">
+                <span className="w-1.5 h-2.5 bg-red-500 rounded-xs -skew-x-12" />
+                <span className="w-1.5 h-2.5 bg-emerald-500 rounded-xs -skew-x-12" />
+                <span className="w-1.5 h-2.5 bg-blue-500 rounded-xs -skew-x-12" />
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1628,12 +1842,85 @@ export default function App() {
                   className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold text-xs cursor-pointer"
                 >
                   <Sparkles className="w-4 h-4 text-sky-400" />
-                  Iniciar Demo {activeConsoleOption.shortLabel}
+                  {activeSystem === 'GAME_GEAR'
+                    ? 'Black Castle GG (Por Defecto)'
+                    : `Iniciar Demo ${activeConsoleOption.shortLabel}`}
                 </button>
               )}
             </div>
 
-            {/* 3. Quick Save States (Slots 1, 2, 3) */}
+            {/* 3. Motor de Audio Estéreo Game Gear (Volumen Maestro + Ganancia Pre-Amp PSG) */}
+            <div className="p-3 rounded-xl border border-slate-800 bg-slate-900/90 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  {soundEnabled && masterVolume > 0 ? (
+                    <Volume2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  ) : (
+                    <VolumeX className="w-4 h-4 text-rose-400 shrink-0" />
+                  )}
+                  <span className="text-xs font-bold text-slate-200">
+                    Motor de Audio PSG SN76489
+                  </span>
+                </div>
+                <span
+                  className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-md border ${
+                    !soundEnabled || masterVolume === 0
+                      ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                      : audioContextRunning
+                        ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                        : 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                  }`}
+                >
+                  {!soundEnabled || masterVolume === 0
+                    ? 'SILENCIADO'
+                    : audioContextRunning
+                      ? 'ACTIVO 48kHz'
+                      : 'LISTO (TOCA PANTALLA)'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-0.5">
+                {/* Master Volume Slider (0% - 100%) */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-slate-400 font-medium">Volumen Maestro</span>
+                    <span className="font-mono font-bold text-sky-400">
+                      {soundEnabled ? `${masterVolume}%` : '0% (MUTE)'}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={soundEnabled ? masterVolume : 0}
+                    onChange={(e) => handleMasterVolumeChange(Number(e.target.value))}
+                    className="w-full h-2 rounded-lg appearance-none bg-slate-800 accent-sky-400 cursor-pointer"
+                  />
+                </div>
+
+                {/* PSG Gain / Pre-Amp Boost Slider (1.0x - 3.0x) */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-slate-400 font-medium">Ganancia Pre-Amp PSG</span>
+                    <span className="font-mono font-bold text-emerald-400">
+                      {psgBoost.toFixed(1)}x
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={1.0}
+                    max={3.0}
+                    step={0.1}
+                    value={psgBoost}
+                    onChange={(e) => handlePsgBoostChange(Number(e.target.value))}
+                    className="w-full h-2 rounded-lg appearance-none bg-slate-800 accent-emerald-400 cursor-pointer"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* 4. Quick Save States (Slots 1, 2, 3) */}
             <div className="space-y-1.5">
               <div className="text-xs font-semibold text-slate-400">
                 Guardado Rápido de Partida (Save States)
@@ -1683,7 +1970,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 4. Console Hardware Toggles (Pause, Reset, Sound, CRT Scanlines, Fullscreen) */}
+            {/* 5. Console Hardware Toggles (Pause, Reset, Sound, CRT Scanlines, Fullscreen) */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1">
               <button
                 onClick={handleTogglePause}

@@ -23,10 +23,16 @@
 }
 
 .safe-shell-padding {
-  padding-top: max(0.5rem, env(safe-area-inset-top));
-  padding-bottom: max(0.65rem, env(safe-area-inset-bottom));
-  padding-left: max(0.65rem, env(safe-area-inset-left));
-  padding-right: max(0.65rem, env(safe-area-inset-right));
+  padding: 0px;
+}
+
+.emulator-screen-mount canvas {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: fill !important;
+  display: block !important;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
 }
 
 .tabular-nums {

@@ -326,6 +326,30 @@ export class GearsystemEngine {
     this.wasm.heapU32[15] = this.score;
   }
 
+  private masterVolumePercent = 90;
+  private psgBoostFactor = 1.8;
+
+  private getTargetSynthGain(): number {
+    if (!this.soundEnabled || this.masterVolumePercent <= 0) return 0;
+    const baseGain = 0.22;
+    return Math.min(
+      0.75,
+      baseGain * (this.masterVolumePercent / 100) * Math.max(1.0, this.psgBoostFactor * 0.7)
+    );
+  }
+
+  public setVolumeParameters(volumePercent: number, psgBoost: number) {
+    this.masterVolumePercent = Math.max(0, Math.min(100, volumePercent));
+    this.psgBoostFactor = Math.max(1.0, Math.min(3.0, psgBoost));
+    if (this.gainNode && this.audioCtx) {
+      const target = this.getTargetSynthGain();
+      this.gainNode.gain.value = target;
+      if (typeof this.gainNode.gain.setTargetAtTime === 'function') {
+        this.gainNode.gain.setTargetAtTime(target, this.audioCtx.currentTime, 0.015);
+      }
+    }
+  }
+
   public toggleAudio(enabled: boolean) {
     this.soundEnabled = enabled;
     if (enabled) {
@@ -335,7 +359,7 @@ export class GearsystemEngine {
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         this.audioCtx = new AudioCtx();
         this.gainNode = this.audioCtx.createGain();
-        this.gainNode.gain.value = 0.045;
+        this.gainNode.gain.value = this.getTargetSynthGain();
         this.gainNode.connect(this.audioCtx.destination);
 
         // YM2612 / SN76489 Hybrid Synth Channels
@@ -350,11 +374,21 @@ export class GearsystemEngine {
         this.osc2.frequency.value = 110;
         this.osc2.connect(this.gainNode);
         this.osc2.start();
-      } else if (this.audioCtx.state === 'suspended') {
-        this.audioCtx.resume();
+      } else {
+        if (this.gainNode) {
+          this.gainNode.gain.value = this.getTargetSynthGain();
+        }
+        if (this.audioCtx.state === 'suspended') {
+          this.audioCtx.resume().catch(() => {});
+        }
       }
-    } else if (this.audioCtx && this.audioCtx.state === 'running') {
-      this.audioCtx.suspend();
+    } else if (this.audioCtx) {
+      if (this.gainNode) {
+        this.gainNode.gain.value = 0;
+      }
+      if (this.audioCtx.state === 'running') {
+        this.audioCtx.suspend().catch(() => {});
+      }
     }
   }
 
