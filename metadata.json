@@ -1,0 +1,6 @@
+{
+  "name": "Gearsystem WebAssembly Studio",
+  "description": "High-performance WebAssembly runtime, Emscripten toolchain configuration, and browser emulator for Gearsystem (Sega Master System, Game Gear, SG-1000).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
